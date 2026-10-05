@@ -1,5 +1,6 @@
 import os, re, hashlib
 from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify, request, send_from_directory
 import requests
 
@@ -25,20 +26,24 @@ DEMO = [
 def brave(endpoint, params):
     key=os.getenv('BRAVE_API_KEY')
     if not key: return None
-    r=requests.get(f'https://api.search.brave.com/res/v1/{endpoint}',headers={'Accept':'application/json','X-Subscription-Token':key},params=params,timeout=15)
-    r.raise_for_status(); return r.json()
+    try:
+        r=requests.get(f'https://api.search.brave.com/res/v1/{endpoint}',headers={'Accept':'application/json','X-Subscription-Token':key},params=params,timeout=15)
+        r.raise_for_status(); return r.json()
+    except requests.RequestException as e:
+        app.logger.warning('Brave %s failed: %s', endpoint, e)
+        return None
 
 def classify(text):
     t=(text or '').lower()
-    rules=[('plan',['plan','floor plan','site plan','ground floor','layout']),('section',['section','cross section','longitudinal','transverse']),('elevation',['elevation','facade','façade']),('detail',['detail','junction','construction detail','assembly']),('photo',['photograph','photo','interior','exterior'])]
-    scores={k:sum(1 for w in words if w in t) for k,words in rules}
+    rules=[('plan',['plan','plans','floor plan','floor plans','site plan','site plans','ground floor','layout','layouts']),('section',['section','sections','cross section','cross sections','longitudinal','transverse']),('elevation',['elevation','elevations','facade','facades','façade','façades']),('detail',['detail','details','junction','junctions','construction detail','assembly','assemblies']),('photo',['photograph','photographs','photo','photos','interior','exterior'])]
+    scores={k:sum(1 for w in words if re.search(r'\b'+re.escape(w)+r'\b',t)) for k,words in rules}
     k=max(scores,key=scores.get)
     return k if scores[k] else 'reference'
 
 def normalize(item, kind='web'):
     title=item.get('title') or item.get('description') or 'Untitled'
     url=item.get('url') or item.get('link') or ''
-    return {'title':title,'url':url,'source':item.get('profile',{}).get('long_name') or item.get('meta_url',{}).get('hostname') or 'Web','type':classify(title+' '+item.get('description','')),'thumbnail':item.get('thumbnail',{}).get('src') if isinstance(item.get('thumbnail'),dict) else None,'kind':kind}
+    return {'id':hashlib.md5((kind+'|'+url).encode()).hexdigest()[:8] if url else None,'title':title,'url':url,'source':item.get('profile',{}).get('long_name') or item.get('meta_url',{}).get('hostname') or 'Web','type':classify(title+' '+item.get('description','')),'thumbnail':item.get('thumbnail',{}).get('src') if isinstance(item.get('thumbnail'),dict) else None,'kind':kind}
 
 @app.get('/')
 def home(): return send_from_directory(app.static_folder,'index.html')
@@ -57,8 +62,8 @@ def project(pid):
     if not p: return jsonify({'error':'Project not found'}),404
     assets=[]
     for typ,n in p['counts'].items():
-        for i in range(min(n,8)):
-            assets.append({'id':hashlib.md5(f'{pid}-{typ}-{i}'.encode()).hexdigest()[:8],'type':typ.rstrip('s'),'title':f'{typ.title()} {i+1}','source':'Project research index','url':f'https://www.google.com/search?q={quote(p["title"]+" "+typ)}','thumbnail':p['image'] if typ=='photos' else None,'confidence':92 if typ!='details' else 84})
+        for i in range(n):
+            assets.append({'id':hashlib.md5(f'{pid}-{typ}-{i}'.encode()).hexdigest()[:8],'type':typ.rstrip('s'),'title':f'{typ.title()} {i+1}','source':'Project research index','url':f'https://www.google.com/search?q={quote(p["title"]+" "+typ)}','thumbnail':p['image'] if typ=='photos' and i==0 else None})
     return jsonify({'project':p,'assets':assets})
 
 @app.get('/api/search')
@@ -72,15 +77,26 @@ def search():
         hay=' '.join([p['title'],p['architect'],p['location'],p['type'],' '.join(p['tags'])]).lower()
         if any(w in hay for w in ql.split()): local.append({'kind':'project','project':p})
     results=[]
+    tasks={}
     if mode in ('all','web'):
-        data=brave('web/search',{'q':q+' architecture project plans sections','count':12,'country':'ALL','search_lang':'en'})
-        if data:
-            results=[normalize(x,'web') for x in data.get('web',{}).get('results',[])]
+        tasks['web']=('web/search',{'q':q+' architecture project plans sections','count':12,'country':'ALL','search_lang':'en'})
     if mode in ('all','images'):
-        data=brave('images/search',{'q':q+' architecture plan section','count':20,'country':'ALL','search_lang':'en'})
-        if data:
-            results += [normalize(x,'image') for x in data.get('results',[])]
-    return jsonify({'query':q,'local':local,'results':results,'mode':'live' if results else 'demo','notice':'Live web search requires BRAVE_API_KEY. Demo catalogue remains available.' if not results else ''})
+        tasks['images']=('images/search',{'q':q+' architecture plan section','count':20,'country':'ALL','search_lang':'en'})
+    if tasks:
+        with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
+            futs={k:ex.submit(brave,*v) for k,v in tasks.items()}
+            data={k:f.result() for k,f in futs.items()}
+        if data.get('web'):
+            results=[normalize(x,'web') for x in data['web'].get('web',{}).get('results',[])]
+        if data.get('images'):
+            results += [normalize(x,'image') for x in data['images'].get('results',[])]
+    if results:
+        notice=''
+    elif not os.getenv('BRAVE_API_KEY'):
+        notice='Live web search requires BRAVE_API_KEY. Demo catalogue remains available.'
+    else:
+        notice='Search returned no results, or the search service is unavailable. Please try again.'
+    return jsonify({'query':q,'local':local,'results':results,'mode':'live' if results else 'demo','notice':notice})
 
 @app.get('/health')
 def health(): return {'ok':True}
